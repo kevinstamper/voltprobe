@@ -20,6 +20,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import kotlin.concurrent.thread
+import kotlin.math.abs
 import kotlin.math.log10
 import kotlin.math.sqrt
 
@@ -29,6 +30,13 @@ class MainActivity : Activity() {
     private val sb = StringBuilder()
     @Volatile private var running = false
     private val rate = 48000
+    @Volatile private var useFloat = false
+    @Volatile private var srcIdx = 0
+    private val srcs = listOf(
+        MediaRecorder.AudioSource.MIC to "MIC",
+        MediaRecorder.AudioSource.UNPROCESSED to "UNPROCESSED",
+        MediaRecorder.AudioSource.VOICE_RECOGNITION to "VOICE_REC"
+    )
     private var pending: (() -> Unit)? = null
     private val am by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
 
@@ -44,6 +52,18 @@ class MainActivity : Activity() {
         addBtn("1. List audio devices") { needMic { listDevices() } }
         addBtn("2. Probe channel counts") { needMic { probe() } }
         addBtn("3. Live meters (start/stop)") { needMic { toggleMeters() } }
+        val modeBtn = Button(this)
+        fun refreshMode() {
+            modeBtn.text = "Mode: ${if (useFloat) "float" else "16-bit"} / ${srcs[srcIdx].second} (tap to change)"
+        }
+        modeBtn.setOnClickListener {
+            val nxt = (srcIdx * 2 + (if (useFloat) 1 else 0) + 1) % (srcs.size * 2)
+            srcIdx = nxt / 2
+            useFloat = nxt % 2 == 1
+            refreshMode()
+        }
+        refreshMode()
+        root.addView(modeBtn)
         addBtn("Copy report") { copy() }
         meter = TextView(this).apply { typeface = Typeface.MONOSPACE; textSize = 13f }
         out = TextView(this).apply { typeface = Typeface.MONOSPACE; textSize = 11f }
@@ -102,16 +122,21 @@ class MainActivity : Activity() {
                 it.productName.toString().contains("volt", ignoreCase = true)
         }
 
-    private fun open(dev: AudioDeviceInfo?, n: Int): AudioRecord? = try {
+    private fun open(
+        dev: AudioDeviceInfo?,
+        n: Int,
+        float: Boolean = useFloat,
+        src: Int = srcIdx
+    ): AudioRecord? = try {
         val fmt = AudioFormat.Builder()
-            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .setEncoding(if (float) AudioFormat.ENCODING_PCM_FLOAT else AudioFormat.ENCODING_PCM_16BIT)
             .setSampleRate(rate)
             .setChannelIndexMask((1 shl n) - 1)
             .build()
         val r = AudioRecord.Builder()
-            .setAudioSource(MediaRecorder.AudioSource.MIC)
+            .setAudioSource(srcs[src].first)
             .setAudioFormat(fmt)
-            .setBufferSizeInBytes(rate * n)
+            .setBufferSizeInBytes(rate * n * (if (float) 4 else 2) / 2)
             .build()
         if (r.state != AudioRecord.STATE_INITIALIZED) {
             r.release()
@@ -131,7 +156,7 @@ class MainActivity : Activity() {
             val dev = usbIn()
             log("USB input: ${dev?.productName ?: "NONE FOUND"}")
             for (n in listOf(1, 2, 3, 4, 6, 8)) {
-                val r = open(dev, n)
+                val r = open(dev, n, false, 0)
                 if (r == null) {
                     log("$n ch: cannot open")
                     continue
@@ -157,13 +182,11 @@ class MainActivity : Activity() {
             return
         }
         running = true
+        val float = useFloat
+        val modeName = "${if (float) "float" else "16-bit"}/${srcs[srcIdx].second}"
         thread {
             val dev = usbIn()
-            log("meters: inputs Android lists right now:")
-            for (d in am.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
-                log("  id=${d.id} type=${d.type} ${d.productName}")
-            }
-            log(if (dev == null) "meters: NO USB INPUT FOUND (plug in the Volt first)" else "meters: using ${dev.productName}")
+            log("meters: mode $modeName; USB input: ${dev?.productName ?: "NONE FOUND"}")
             var n = 0
             var r: AudioRecord? = null
             for (c in listOf(4, 2, 1)) {
@@ -180,27 +203,34 @@ class MainActivity : Activity() {
             }
             r.startRecording()
             log("meters: $n ch, routed=${r.routedDevice?.productName} type=${r.routedDevice?.type}")
-            val buf = ShortArray(rate / 20 * n)
+            val frames = rate / 20
+            val sbuf = ShortArray(if (float) 0 else frames * n)
+            val fbuf = FloatArray(if (float) frames * n else 0)
             while (running) {
-                val got = r.read(buf, 0, buf.size)
+                val got = if (float) r.read(fbuf, 0, fbuf.size, AudioRecord.READ_BLOCKING)
+                else r.read(sbuf, 0, sbuf.size)
                 if (got <= 0) break
                 val f = got / n
                 val txt = StringBuilder()
                 for (c in 0 until n) {
                     var s = 0.0
+                    var pk = 0.0
                     for (i in 0 until f) {
-                        val v = buf[i * n + c].toDouble()
+                        val v = if (float) fbuf[i * n + c].toDouble() else sbuf[i * n + c] / 32768.0
                         s += v * v
+                        val a = abs(v)
+                        if (a > pk) pk = a
                     }
-                    val db = 20 * log10(sqrt(s / f) / 32768.0 + 1e-9)
-                    val bars = (((db + 80) / 80).coerceIn(0.0, 1.0) * 24).toInt()
-                    txt.append("In${c + 1} ")
+                    val rms = 20 * log10(sqrt(s / f) + 1e-9)
+                    val pdb = 20 * log10(pk + 1e-9)
+                    val bars = (((rms + 80) / 80).coerceIn(0.0, 1.0) * 24).toInt()
+                    txt.append(String.format("In%d ", c + 1))
                         .append("█".repeat(bars))
                         .append("░".repeat(24 - bars))
-                        .append(String.format(" %5.1f dB\n", db))
+                        .append(String.format(" rms %5.1f pk %5.1f\n", rms, pdb))
                 }
                 val rd = r.routedDevice
-                val t = "ROUTED: ${rd?.productName} (type ${rd?.type})\n" + txt.toString()
+                val t = "ROUTED: ${rd?.productName} (type ${rd?.type}) $modeName ${r.channelCount}ch\n" + txt.toString()
                 runOnUiThread { meter.text = t }
             }
             r.stop()
