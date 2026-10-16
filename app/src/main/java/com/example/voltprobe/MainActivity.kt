@@ -52,6 +52,7 @@ class MainActivity : Activity() {
         addBtn("1. List audio devices") { needMic { listDevices() } }
         addBtn("2. Probe channel counts") { needMic { probe() } }
         addBtn("3. Live meters (start/stop)") { needMic { toggleMeters() } }
+        addBtn("4. Mask scan (steady signal on ONE input)") { needMic { maskScan() } }
         val modeBtn = Button(this)
         fun refreshMode() {
             modeBtn.text = "Mode: ${if (useFloat) "float" else "16-bit"} / ${srcs[srcIdx].second} (tap to change)"
@@ -126,12 +127,13 @@ class MainActivity : Activity() {
         dev: AudioDeviceInfo?,
         n: Int,
         float: Boolean = useFloat,
-        src: Int = srcIdx
+        src: Int = srcIdx,
+        mask: Int = (1 shl n) - 1
     ): AudioRecord? = try {
         val fmt = AudioFormat.Builder()
             .setEncoding(if (float) AudioFormat.ENCODING_PCM_FLOAT else AudioFormat.ENCODING_PCM_16BIT)
             .setSampleRate(rate)
-            .setChannelIndexMask((1 shl n) - 1)
+            .setChannelIndexMask(mask)
             .build()
         val r = AudioRecord.Builder()
             .setAudioSource(srcs[src].first)
@@ -237,6 +239,62 @@ class MainActivity : Activity() {
             r.release()
             running = false
             runOnUiThread { meter.text = "" }
+        }
+    }
+
+    private fun measure(r: AudioRecord, n: Int, float: Boolean, frames: Int): DoubleArray {
+        val sums = DoubleArray(n)
+        var done = 0
+        val sbuf = ShortArray(if (float) 0 else 4800 * n)
+        val fbuf = FloatArray(if (float) 4800 * n else 0)
+        while (done < frames) {
+            val got = if (float) r.read(fbuf, 0, fbuf.size, AudioRecord.READ_BLOCKING)
+            else r.read(sbuf, 0, sbuf.size)
+            if (got <= 0) break
+            val f = got / n
+            for (i in 0 until f) {
+                for (c in 0 until n) {
+                    val v = if (float) fbuf[i * n + c].toDouble() else sbuf[i * n + c] / 32768.0
+                    sums[c] += v * v
+                }
+            }
+            done += f
+        }
+        return DoubleArray(n) { 20 * log10(sqrt(sums[it] / maxOf(done, 1)) + 1e-9) }
+    }
+
+    private fun maskScan() {
+        if (running) {
+            log("Stop the live meters first")
+            return
+        }
+        thread {
+            val float = useFloat
+            log("== MASK SCAN ${if (float) "float" else "16-bit"}/${srcs[srcIdx].second} ==")
+            log("(mask: rightmost digit = Volt input 1; values are dB per app channel)")
+            val dev = usbIn()
+            for (mask in listOf(1, 2, 4, 8, 3, 12, 15)) {
+                val n = Integer.bitCount(mask)
+                val r = open(dev, n, float, srcIdx, mask)
+                if (r == null) {
+                    log("mask ${Integer.toBinaryString(mask)}: cannot open")
+                    continue
+                }
+                try {
+                    r.startRecording()
+                    measure(r, n, float, 4800)
+                    val db = measure(r, n, float, 48000)
+                    log(
+                        String.format("mask %4s: ", Integer.toBinaryString(mask)) +
+                            db.joinToString("  ") { String.format("%.0f", it) }
+                    )
+                } catch (e: Exception) {
+                    log("mask ${Integer.toBinaryString(mask)}: error ${e.message}")
+                } finally {
+                    r.release()
+                }
+            }
+            log("")
         }
     }
 
