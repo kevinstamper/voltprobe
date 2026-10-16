@@ -97,7 +97,9 @@ class MainActivity : Activity() {
 
     private fun usbIn(): AudioDeviceInfo? =
         am.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull {
-            it.type == AudioDeviceInfo.TYPE_USB_DEVICE || it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+            it.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                it.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+                it.productName.toString().contains("volt", ignoreCase = true)
         }
 
     private fun open(dev: AudioDeviceInfo?, n: Int): AudioRecord? = try {
@@ -157,6 +159,11 @@ class MainActivity : Activity() {
         running = true
         thread {
             val dev = usbIn()
+            log("meters: inputs Android lists right now:")
+            for (d in am.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
+                log("  id=${d.id} type=${d.type} ${d.productName}")
+            }
+            log(if (dev == null) "meters: NO USB INPUT FOUND (plug in the Volt first)" else "meters: using ${dev.productName}")
             var n = 0
             var r: AudioRecord? = null
             for (c in listOf(4, 2, 1)) {
@@ -171,8 +178,8 @@ class MainActivity : Activity() {
                 running = false
                 return@thread
             }
-            log("meters: $n ch, routed=${r.routedDevice?.productName}")
             r.startRecording()
+            log("meters: $n ch, routed=${r.routedDevice?.productName} type=${r.routedDevice?.type}")
             val buf = ShortArray(rate / 20 * n)
             while (running) {
                 val got = r.read(buf, 0, buf.size)
@@ -192,7 +199,8 @@ class MainActivity : Activity() {
                         .append("░".repeat(24 - bars))
                         .append(String.format(" %5.1f dB\n", db))
                 }
-                val t = txt.toString()
+                val rd = r.routedDevice
+                val t = "ROUTED: ${rd?.productName} (type ${rd?.type})\n" + txt.toString()
                 runOnUiThread { meter.text = t }
             }
             r.stop()
